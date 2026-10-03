@@ -1,6 +1,7 @@
 package com.github.h3yow.marketdataaggregatorjava.service;
 
 import com.github.h3yow.marketdataaggregatorjava.domain.Candle;
+import com.github.h3yow.marketdataaggregatorjava.domain.CompactionReport;
 import com.github.h3yow.marketdataaggregatorjava.domain.CursorPage;
 import com.github.h3yow.marketdataaggregatorjava.domain.IngestResult;
 import com.github.h3yow.marketdataaggregatorjava.domain.TradeTick;
@@ -17,4 +18,6 @@ public interface MarketDataService {
     List<Candle> queryCandles(String symbol, Long fromWindowStart, Long toWindowStart);
 
     CursorPage pull(String symbol, String cursor, int limit);
+
+    CompactionReport compact(String symbol);
 }

@@ -1,6 +1,7 @@
 package com.github.h3yow.marketdataaggregatorjava.web;
 
 import com.github.h3yow.marketdataaggregatorjava.domain.Candle;
+import com.github.h3yow.marketdataaggregatorjava.domain.CompactionReport;
 import com.github.h3yow.marketdataaggregatorjava.domain.CursorEvent;
 import com.github.h3yow.marketdataaggregatorjava.domain.CursorPage;
 import com.github.h3yow.marketdataaggregatorjava.domain.IngestResult;
@@ -76,8 +77,17 @@ public class MarketDataController {
         return new CursorPageResponse(page.symbol(), views, page.nextCursor(), page.hasMore());
     }
 
+    /**
+     * 压缩该标的的事件日志：折叠已结算窗口的历史事件（seq 不重编号，
+     * 已签发游标全部继续有效）。返回本次压缩的统计报告。
+     */
+    @PostMapping("/symbols/{symbol}/compact")
+    public CompactionReport compact(@PathVariable String symbol) {
+        return marketDataService.compact(symbol);
+    }
+
     private static CandleResponse toCandleResponse(Candle c) {
         return new CandleResponse(c.windowStart(), c.windowEnd(), c.open(), c.high(), c.low(),
-                c.close(), c.volume(), c.gap(), c.corrected(), c.version());
+                c.close(), c.volume(), c.gap(), c.corrected(), c.version(), c.settled());
     }
 }

@@ -5,6 +5,7 @@ import com.github.h3yow.marketdataaggregatorjava.domain.Candle;
 import com.github.h3yow.marketdataaggregatorjava.domain.IngestStatus;
 import com.github.h3yow.marketdataaggregatorjava.domain.TradeTick;
 import com.github.h3yow.marketdataaggregatorjava.service.AggregationStore;
+import com.github.h3yow.marketdataaggregatorjava.service.CompactionService;
 import com.github.h3yow.marketdataaggregatorjava.service.IngestService;
 import com.github.h3yow.marketdataaggregatorjava.service.MarketDataService;
 import com.github.h3yow.marketdataaggregatorjava.service.QueryService;
@@ -50,7 +51,7 @@ class AggregationWindowTest {
         ingestService = new IngestService(store);
         queryService = new QueryService(store, props);
         marketDataService = new MarketDataServiceImpl(ingestService, queryService,
-                new CursorService(store, props));
+                new CursorService(store, props), new CompactionService(store));
     }
 
     private void send(long id, long offset, double price, long volume) {

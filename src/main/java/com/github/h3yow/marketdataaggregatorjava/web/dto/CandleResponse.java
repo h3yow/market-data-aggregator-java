@@ -12,5 +12,6 @@ public record CandleResponse(long windowStart,
                              long volume,
                              boolean gap,
                              boolean corrected,
-                             long version) {
+                             long version,
+                             boolean settled) {
 }

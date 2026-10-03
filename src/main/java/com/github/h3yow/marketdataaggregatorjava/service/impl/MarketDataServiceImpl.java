@@ -1,9 +1,11 @@
 package com.github.h3yow.marketdataaggregatorjava.service.impl;
 
 import com.github.h3yow.marketdataaggregatorjava.domain.Candle;
+import com.github.h3yow.marketdataaggregatorjava.domain.CompactionReport;
 import com.github.h3yow.marketdataaggregatorjava.domain.CursorPage;
 import com.github.h3yow.marketdataaggregatorjava.domain.IngestResult;
 import com.github.h3yow.marketdataaggregatorjava.domain.TradeTick;
+import com.github.h3yow.marketdataaggregatorjava.service.CompactionService;
 import com.github.h3yow.marketdataaggregatorjava.service.CursorService;
 import com.github.h3yow.marketdataaggregatorjava.service.IngestService;
 import com.github.h3yow.marketdataaggregatorjava.service.MarketDataService;
@@ -21,13 +23,16 @@ public class MarketDataServiceImpl implements MarketDataService {
     private final IngestService ingestService;
     private final QueryService queryService;
     private final CursorService cursorService;
+    private final CompactionService compactionService;
 
     public MarketDataServiceImpl(IngestService ingestService,
                                  QueryService queryService,
-                                 CursorService cursorService) {
+                                 CursorService cursorService,
+                                 CompactionService compactionService) {
         this.ingestService = ingestService;
         this.queryService = queryService;
         this.cursorService = cursorService;
+        this.compactionService = compactionService;
     }
 
     @Override
@@ -43,5 +48,10 @@ public class MarketDataServiceImpl implements MarketDataService {
     @Override
     public CursorPage pull(String symbol, String cursor, int limit) {
         return cursorService.pull(symbol, cursor, limit);
+    }
+
+    @Override
+    public CompactionReport compact(String symbol) {
+        return compactionService.compact(symbol);
     }
 }

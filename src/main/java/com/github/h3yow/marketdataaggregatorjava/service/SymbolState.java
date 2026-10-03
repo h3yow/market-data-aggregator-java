@@ -59,6 +59,7 @@ public final class SymbolState {
         public long tickCount;
         public boolean gap = true;
         public boolean corrected = false;
+        public boolean settled = false;
         public long version = 1;
 
         public WindowAgg(long windowStart) {
@@ -92,10 +93,10 @@ public final class SymbolState {
         public Candle snapshot(String sym, long windowSizeMillis) {
             if (gap) {
                 return new Candle(sym, windowStart, windowStart + windowSizeMillis,
-                        null, null, null, null, 0L, true, false, version);
+                        null, null, null, null, 0L, true, false, version, settled);
             }
             return new Candle(sym, windowStart, windowStart + windowSizeMillis,
-                    open, high, low, close, volume, false, corrected, version);
+                    open, high, low, close, volume, false, corrected, version, settled);
         }
     }
 }

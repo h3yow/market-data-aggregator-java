@@ -18,7 +18,8 @@ import java.util.List;
  *
  * <p>使用固定基准时间（非墙上时钟），每次启动推送完全相同的脚本，结果可复现。
  * 脚本依次覆盖：正常推进 → 重复推送 → 窗口内乱序归位 → 超容忍倒退拒绝 →
- * 字段非法拒绝 → 跨窗口产生缺口 → 迟到数据回补缺口 → 再次跨窗口标记新缺口。
+ * 字段非法拒绝 → 跨窗口产生缺口 → 迟到数据回补缺口 → 再次跨窗口标记新缺口 →
+ * 大幅推进水位触发早期窗口结算（WINDOW_SETTLED）。
  * 可通过 {@code market-data.injector-enabled=false} 关闭。
  */
 @Component
@@ -57,7 +58,8 @@ public class LocalTickInjector implements ApplicationRunner {
                 new long[]{1007, 3500, 1200, 3},   // 跳到 w3，w1/w2 标缺口
                 new long[]{1008, 1500, 1020, 2},   // 迟到回补缺口 w1
                 new long[]{1009, 2500, 1080, 1},   // 迟到回补缺口 w2
-                new long[]{1010, 5200, 1300, 4}    // 跳到 w5，w4 标缺口
+                new long[]{1010, 5200, 1300, 4},   // 跳到 w5，w4 标缺口
+                new long[]{1011, 12000, 1400, 2}   // 跳到 w12：w6..w11 标缺口，w0..w6 越过 终点+容忍 而结算
         );
         log.info("[INJECTOR] 开始注入 {} 笔确定性行情，symbol={}, windowSize={}ms, tolerance={}ms",
                 script.size() + 1, SYMBOL, properties.getWindowSizeMillis(),

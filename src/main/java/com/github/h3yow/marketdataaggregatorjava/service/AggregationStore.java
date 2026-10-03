@@ -2,6 +2,7 @@ package com.github.h3yow.marketdataaggregatorjava.service;
 
 import com.github.h3yow.marketdataaggregatorjava.config.MarketDataProperties;
 import com.github.h3yow.marketdataaggregatorjava.domain.Candle;
+import com.github.h3yow.marketdataaggregatorjava.domain.CompactionReport;
 import com.github.h3yow.marketdataaggregatorjava.domain.CursorEvent;
 import com.github.h3yow.marketdataaggregatorjava.domain.EventType;
 import com.github.h3yow.marketdataaggregatorjava.domain.IngestResult;
@@ -138,10 +139,13 @@ public class AggregationStore {
         state.watermark = tick.timestamp();
 
         if (ws == prevMax) {
-            // 仍在当前开放窗口内：更新快照，不产生新的游标事件（开放窗口的实时值走快照查询）
+            // 仍在当前开放窗口内：更新快照并下发 WINDOW_UPDATE，
+            // 使事件流重放能得到与快照查询完全一致的窗口最新状态
             SymbolState.WindowAgg agg = state.windows.get(ws);
             agg.apply(tick.timestamp(), tick.price(), tick.volume());
             state.seenTradeIds.add(tick.tradeId());
+            appendEvent(state, EventType.WINDOW_UPDATE, agg, windowSize);
+            settleWindows(state, windowSize);
             return result(IngestStatus.ACCEPTED, "时间戳不早于水位，并入当前开放窗口 " + ws, ws, tick);
         }
 
@@ -158,10 +162,40 @@ public class AggregationStore {
         agg.apply(tick.timestamp(), tick.price(), tick.volume());
         state.seenTradeIds.add(tick.tradeId());
         appendEvent(state, EventType.WINDOW_OPEN, agg, windowSize);
+        settleWindows(state, windowSize);
         long gapCount = (ws - prevMax) / windowSize - 1;
         return result(IngestStatus.ACCEPTED,
                 "水位推进至窗口 " + ws + "，中间标记缺口窗口 " + gapCount + " 个，新窗口开窗",
                 ws, tick);
+    }
+
+    /**
+     * 窗口结算判定（唯一确定、可复现）：
+     * 窗口 X 已结算 ⟺ 当前水位 {@code watermark >= X.windowStart + W + tolerance}。
+     *
+     * <p>此时该窗口内任何可能的时间戳 ts（&lt; X.windowStart + W）都有
+     * {@code watermark - ts > tolerance}，即任何迟到数据都会被判 {@link IngestStatus#REJECTED_STALE}，
+     * 窗口不再可能被修正；同时水位已越过窗口终点，必然存在更晚的窗口推进了它。
+     * 与乱序容忍规则严格一致，且只是已接受行情序列的纯函数，重放结果可复现。
+     *
+     * <p>每次水位推进后按窗口起点升序扫描，每个窗口至多结算一次，
+     * 结算时追加 {@link EventType#WINDOW_SETTLED} 事件（携带该窗口最终快照）。
+     */
+    private void settleWindows(SymbolState state, long windowSize) {
+        long settleBefore = state.watermark - tolerance() - windowSize;
+        for (SymbolState.WindowAgg agg : state.windows.values()) {
+            if (agg.settled) {
+                continue;
+            }
+            if (agg.windowStart > settleBefore) {
+                break; // 窗口按起点升序，后续窗口只会更晚，都不可能结算
+            }
+            agg.settled = true;
+            appendEvent(state, EventType.WINDOW_SETTLED, agg, windowSize);
+            log.info("[SETTLE] symbol={} window={} 已结算：水位={} >= 窗口终点+容忍={}，窗口不再接受修正",
+                    state.symbol, agg.windowStart, state.watermark,
+                    agg.windowStart + windowSize + tolerance());
+        }
     }
 
     private void appendEvent(SymbolState state, EventType type, SymbolState.WindowAgg agg, long windowSize) {
@@ -230,6 +264,57 @@ public class AggregationStore {
         }
         synchronized (state) {
             return state.nextSeq - 1;
+        }
+    }
+
+    /**
+     * 压缩事件日志：折叠已结算窗口的历史事件。
+     *
+     * <p>规则：每个已结算窗口只保留它的 {@link EventType#WINDOW_SETTLED} 事件
+     * （该事件携带窗口最终快照，且恒为该窗口的最后一条事件——结算后任何迟到数据
+     * 都会被拒绝，不可能再有新事件）；未结算窗口的事件一律不动。
+     * 被保留事件的 seq 不重编号，因此：
+     * <ul>
+     *   <li>任何已签发游标压缩后仍然有效，继续拉取 {@code seq > cursor} 的事件即可；</li>
+     *   <li>被删除事件的窗口最终状态，必由同窗口的 WINDOW_SETTLED 事件（seq 更大）承载，
+     *       客户端重放（同窗口后到的快照覆盖先到的）得到的视图与压缩前完全一致；</li>
+     *   <li>同一 seq 永远不会重复下发，也不会出现“事件里一套、快照另一套”。</li>
+     * </ul>
+     * 在与接入相同的 {@code synchronized(state)} 临界区内执行，压缩与读写不会交错。
+     * 幂等：对已压缩过的日志再次执行不删除任何事件。
+     */
+    public CompactionReport compact(String symbol) {
+        SymbolState state = states.get(symbol);
+        if (state == null) {
+            return new CompactionReport(symbol, 0, 0, 0, 0L);
+        }
+        synchronized (state) {
+            List<CursorEvent> kept = new ArrayList<>(state.events.size());
+            int dropped = 0;
+            long maxDroppedSeq = 0L;
+            int settledWindows = 0;
+            for (CursorEvent event : state.events) {
+                SymbolState.WindowAgg agg = state.windows.get(event.candle().windowStart());
+                boolean collapsible = agg != null && agg.settled
+                        && event.type() != EventType.WINDOW_SETTLED;
+                if (collapsible) {
+                    dropped++;
+                    maxDroppedSeq = Math.max(maxDroppedSeq, event.seq());
+                } else {
+                    kept.add(event);
+                }
+            }
+            for (SymbolState.WindowAgg agg : state.windows.values()) {
+                if (agg.settled) {
+                    settledWindows++;
+                }
+            }
+            state.events.clear();
+            state.events.addAll(kept);
+            CompactionReport report = new CompactionReport(
+                    symbol, settledWindows, dropped, kept.size(), maxDroppedSeq);
+            log.info("[COMPACT] {}", report);
+            return report;
         }
     }
 }
