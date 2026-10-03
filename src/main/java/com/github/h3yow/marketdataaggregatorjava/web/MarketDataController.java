@@ -78,6 +78,6 @@ public class MarketDataController {
 
     private static CandleResponse toCandleResponse(Candle c) {
         return new CandleResponse(c.windowStart(), c.windowEnd(), c.open(), c.high(), c.low(),
-                c.close(), c.volume(), c.gap(), c.corrected(), c.version());
+                c.close(), c.volume(), c.gap(), c.corrected(), c.version(), c.settled());
     }
 }

@@ -78,9 +78,13 @@ public class AggregationStore {
             if (state.maxWindowStart != null && tick.timestamp() < state.watermark) {
                 long lag = state.watermark - tick.timestamp();
                 if (lag > tolerance()) {
+                    SymbolState.WindowAgg settledAgg = state.windows.get(ws);
+                    String settledHint = settledAgg != null && settledAgg.settled
+                            ? "（窗口 " + ws + " 已结算，结论不可再修正）" : "";
                     return result(IngestStatus.REJECTED_STALE,
                             "时间戳倒退 " + lag + "ms 超过乱序容忍 " + tolerance()
-                                    + "ms（水位=" + state.watermark + "），拒绝且不修改任何窗口",
+                                    + "ms（水位=" + state.watermark + "）" + settledHint
+                                    + "，拒绝且不修改任何窗口",
                             null, tick);
                 }
                 return applyLate(state, tick, ws, lag, windowSize);
@@ -138,11 +142,15 @@ public class AggregationStore {
         state.watermark = tick.timestamp();
 
         if (ws == prevMax) {
-            // 仍在当前开放窗口内：更新快照，不产生新的游标事件（开放窗口的实时值走快照查询）
+            // 仍在当前开放窗口内：更新快照，并发 WINDOW_UPDATE 完整快照事件，
+            // 使“从事件重放”得到的 OHLCV/量与区间快照查询逐窗口完全一致
             SymbolState.WindowAgg agg = state.windows.get(ws);
             agg.apply(tick.timestamp(), tick.price(), tick.volume());
             state.seenTradeIds.add(tick.tradeId());
-            return result(IngestStatus.ACCEPTED, "时间戳不早于水位，并入当前开放窗口 " + ws, ws, tick);
+            appendEvent(state, EventType.WINDOW_UPDATE, agg, windowSize);
+            settleWindows(state, windowSize);
+            return result(IngestStatus.ACCEPTED,
+                    "时间戳不早于水位，并入当前开放窗口 " + ws + "（WINDOW_UPDATE）", ws, tick);
         }
 
         // 跨越了一个或多个窗口：严格位于 (prevMax, ws) 之间、无任何行情的窗口标记为缺口
@@ -159,9 +167,57 @@ public class AggregationStore {
         state.seenTradeIds.add(tick.tradeId());
         appendEvent(state, EventType.WINDOW_OPEN, agg, windowSize);
         long gapCount = (ws - prevMax) / windowSize - 1;
+        // 水位推进可能使旧窗口满足结算条件，按窗口起点顺序补发 SETTLED
+        long settledCount = settleWindows(state, windowSize);
+        String settledNote = settledCount > 0 ? "，结算窗口 " + settledCount + " 个" : "";
         return result(IngestStatus.ACCEPTED,
-                "水位推进至窗口 " + ws + "，中间标记缺口窗口 " + gapCount + " 个，新窗口开窗",
+                "水位推进至窗口 " + ws + "，中间标记缺口窗口 " + gapCount + " 个，新窗口开窗"
+                        + settledNote,
                 ws, tick);
+    }
+
+    /**
+     * 结算扫描（必须在持有 state 监视器时调用）。
+     *
+     * <p>结算规则（唯一确定、与迟到容忍规则一致）：窗口 {@code w} 同时满足
+     * <ol>
+     *   <li>已被更晚的窗口推进：{@code w < maxWindowStart}（maxWindowStart 是当前开放窗口，永不结算）；</li>
+     *   <li>已超过乱序容忍：{@code watermark >= w + W + tolerance}。</li>
+     * </ol>
+     * 条件 2 意味着任何还能被接受的行情（时间戳 {@code >= watermark - tolerance}）
+     * 都不可能落入 w（窗口右端点 w+W 已早于该下界），所以结算后不会再出现修正：
+     * 迟到量 {@code > tolerance} 的成交一律 REJECTED_STALE。反之，只要
+     * {@code watermark < w + W + tolerance}，w 仍可能收到容忍内迟到成交，绝不提前结算。
+     *
+     * <p>窗口表按起点有序，满足条件的窗口构成有序前缀；遍历到第一个未结算且
+     * 暂不满足条件的窗口后，起点更大的窗口也不可能满足，立即结束。
+     *
+     * @return 本次新结算的窗口数
+     */
+    private long settleWindows(SymbolState state, long windowSize) {
+        if (state.maxWindowStart == null) {
+            return 0;
+        }
+        long cutoff = state.maxWindowStart; // 开放窗口本身不结算
+        long settledCount = 0;
+        for (SymbolState.WindowAgg agg : state.windows.values()) {
+            if (agg.windowStart >= cutoff) {
+                break;
+            }
+            if (!agg.settled && state.watermark >= agg.windowStart + windowSize + tolerance()) {
+                agg.settled = true;
+                appendEvent(state, EventType.SETTLED, agg, windowSize);
+                log.info("[SETTLE] symbol={} window={} 结算：watermark={} >= {} + {} + {}，"
+                                + "此后该窗口不可再修正（gap={}, corrected={}, version={})",
+                        state.symbol, agg.windowStart, state.watermark,
+                        agg.windowStart, windowSize, tolerance(),
+                        agg.gap, agg.corrected, agg.version);
+                settledCount++;
+            } else if (!agg.settled) {
+                break;
+            }
+        }
+        return settledCount;
     }
 
     private void appendEvent(SymbolState state, EventType type, SymbolState.WindowAgg agg, long windowSize) {
@@ -200,6 +256,10 @@ public class AggregationStore {
 
     /**
      * 读取 seq 严格大于 afterSeq 的事件，最多 limit 条，保持追加顺序。
+     *
+     * <p>归档段 + 热段共同构成完整的事件序列（{@code trimmedBaseSeq < seq <= nextSeq-1}），
+     * 因此只要归档未被物理清除，压缩前后用同一游标拉取结果完全一致（不重不漏）。
+     * 调用方应先通过 {@link #trimmedBaseSeq(String)} 判断游标是否已不可用。
      */
     public List<CursorEvent> readEvents(String symbol, long afterSeq, int limit) {
         SymbolState state = states.get(symbol);
@@ -208,6 +268,14 @@ public class AggregationStore {
         }
         synchronized (state) {
             List<CursorEvent> out = new ArrayList<>();
+            for (CursorEvent event : state.archive) {
+                if (event.seq() > afterSeq) {
+                    out.add(event);
+                    if (out.size() >= limit) {
+                        return out;
+                    }
+                }
+            }
             for (CursorEvent event : state.events) {
                 if (event.seq() > afterSeq) {
                     out.add(event);
@@ -230,6 +298,95 @@ public class AggregationStore {
         }
         synchronized (state) {
             return state.nextSeq - 1;
+        }
+    }
+
+    /**
+     * 物理清除后不可用的最大 seq：游标 seq 小于该值即无法再回放（无归档可恢复）。
+     * 未发生过物理清除时为 0。
+     */
+    public long trimmedBaseSeq(String symbol) {
+        SymbolState state = states.get(symbol);
+        if (state == null) {
+            return 0L;
+        }
+        synchronized (state) {
+            return state.trimmedBaseSeq;
+        }
+    }
+
+    /**
+     * 恢复起点信息：物理清除后，客户端可从返回的 seq 之后继续。
+     *
+     * @param symbol 标的
+     * @return [0]=可恢复的最早热事件 seq（afterSeq 语义，从其后继续），
+     *         [1]=该事件对应窗口起点；无任何热事件时返回 null
+     */
+    public long[] recoveryPoint(String symbol) {
+        SymbolState state = states.get(symbol);
+        if (state == null || state.events.isEmpty()) {
+            return null;
+        }
+        synchronized (state) {
+            CursorEvent first = state.events.get(0);
+            return new long[]{first.seq() - 1, first.candle().windowStart()};
+        }
+    }
+
+    /**
+     * 把“所属窗口已结算”的最长连续 seq 前缀移入归档。
+     *
+     * <p>从热段第一条事件起顺序扫描：事件所属窗口已结算即纳入，遇到第一个所属窗口
+     * 未结算的事件即停止（窗口按起点有序，其后不可能再出现可归档事件）。因此归档的
+     * 总是 {@code 1..k} 的连续前缀，seq 顺序与编号不变，拉取时按全局 seq 合并
+     * 归档段与热段即可。
+     *
+     * <p>同一窗口的事件可能跨在边界两侧（窗口的 SETTLED 序号晚于更晚窗口的
+     * OPEN/GAP 事件）：这是允许的。每条事件都携带完整快照，折叠后仍得到窗口最终
+     * 状态，重放一致性不依赖“同一窗口事件连续存放”。
+     *
+     * @return [0]=本次归档到的最大 seq（无事件可归档为 0），[1]=归档事件条数
+     */
+    public long[] archiveSettledPrefix(String symbol) {
+        SymbolState state = states.get(symbol);
+        if (state == null) {
+            return new long[]{0L, 0L};
+        }
+        synchronized (state) {
+            long eligibleSeq = state.archivedToSeq;
+            int count = 0;
+            for (CursorEvent event : state.events) {
+                SymbolState.WindowAgg agg = state.windows.get(event.candle().windowStart());
+                if (agg == null || !agg.settled) {
+                    break;
+                }
+                eligibleSeq = event.seq();
+                count++;
+            }
+            if (count == 0) {
+                return new long[]{0L, 0L};
+            }
+            state.archive.addAll(state.events.subList(0, count));
+            state.events.subList(0, count).clear();
+            state.archivedToSeq = eligibleSeq;
+            return new long[]{eligibleSeq, count};
+        }
+    }
+
+    /**
+     * 物理清除归档段：已归档事件被丢弃，热日志成为唯一事件来源。
+     *
+     * @return 清除后热日志的起点 seq（不可用边界：游标 seq 小于该值即 UNAVAILABLE）
+     */
+    public long trimArchive(String symbol) {
+        SymbolState state = states.get(symbol);
+        if (state == null) {
+            return 0L;
+        }
+        synchronized (state) {
+            state.archive.clear();
+            state.trimmedBaseSeq = state.archivedToSeq;
+            return state.trimmedBaseSeq;
         }
     }
 }

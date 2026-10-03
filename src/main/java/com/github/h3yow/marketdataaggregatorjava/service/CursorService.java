@@ -52,6 +52,7 @@ public class CursorService {
     public CursorPage pull(String symbol, String cursor, int requestedLimit) {
         int limit = Math.max(MIN_LIMIT, Math.min(MAX_LIMIT, requestedLimit));
         long afterSeq = decode(symbol, cursor);
+        checkAvailable(symbol, afterSeq);
 
         List<CursorEvent> events = store.readEvents(symbol, afterSeq, limit);
         long lastSeq = events.isEmpty() ? afterSeq : events.get(events.size() - 1).seq();
@@ -63,6 +64,39 @@ public class CursorService {
         log.info("[CURSOR] symbol={} afterSeq={} limit={} 返回 {} 条, lastSeq={}, hasMore={}",
                 symbol, afterSeq, limit, events.size(), lastSeq, hasMore);
         return new CursorPage(symbol, List.copyOf(events), nextCursor, hasMore);
+    }
+
+    /**
+     * 判断游标位置是否仍在服务端可回放范围内。
+     *
+     * <p>仅当已结算历史被“归档后物理清除”时，早于热日志起点的位置才无法服务：
+     * 归档保留期间，旧游标始终经归档段完整回放。无法服务时抛出
+     * {@link CursorException.Reason#UNAVAILABLE}，并给出可恢复起点
+     * （recoverAfterSeq + 对应窗口起点）与新游标。
+     */
+    private void checkAvailable(String symbol, long afterSeq) {
+        long hotBase = store.trimmedBaseSeq(symbol);
+        if (hotBase <= 0 || afterSeq >= hotBase) {
+            return;
+        }
+        long[] point = store.recoveryPoint(symbol);
+        Long recoverAfterSeq = point == null ? null : point[0];
+        Long recoverWindowStart = point == null ? null : point[1];
+        String recoverCursor = point == null ? null : issue(symbol, point[0]);
+        throw new CursorException(CursorException.Reason.UNAVAILABLE,
+                "游标位置 seq=" + afterSeq + " 对应的事件已被压缩并物理清除（不可用边界 seq<"
+                        + hotBase + "），无法从该位置继续重放；请从可恢复起点"
+                        + " recoverAfterSeq=" + recoverAfterSeq
+                        + "（windowStart=" + recoverWindowStart + "）使用 recoverCursor 继续",
+                recoverAfterSeq, recoverWindowStart)
+                .withRecoverCursor(recoverCursor);
+    }
+
+    /**
+     * 为恢复起点签发票据（供异常处理器向客户端下发 recoverCursor）。
+     */
+    public String recoverCursor(String symbol, Long recoverAfterSeq) {
+        return recoverAfterSeq == null ? null : issue(symbol, recoverAfterSeq);
     }
 
     /**

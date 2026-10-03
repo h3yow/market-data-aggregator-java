@@ -31,7 +31,20 @@ public final class SymbolState {
     public final Set<Long> seenTradeIds = new HashSet<>();
     public long watermark = Long.MIN_VALUE;
     public Long maxWindowStart = null;
+    /**
+     * 热事件日志：只追加，保存 {@code seq > archivedToSeq} 的事件。
+     * seq 从 1 单调递增，压缩只移动事件、不复用序号。
+     */
     public final List<CursorEvent> events = new ArrayList<>();
+    /**
+     * 归档事件段：保存 {@code trimmedBaseSeq < seq <= archivedToSeq} 的事件，顺序不变。
+     * 只要归档保留，早期游标仍可完整回放（与压缩前不重不漏）。
+     */
+    public final List<CursorEvent> archive = new ArrayList<>();
+    /** 已归档的最大 seq（热日志起点的前一个序号；从未归档为 0）。 */
+    public long archivedToSeq = 0L;
+    /** 物理清除后不可用的最大 seq：游标 seq 小于该值判 UNAVAILABLE；未清除为 0。 */
+    public long trimmedBaseSeq = 0L;
     public long nextSeq = 1L;
 
     public SymbolState(String symbol) {
@@ -59,6 +72,7 @@ public final class SymbolState {
         public long tickCount;
         public boolean gap = true;
         public boolean corrected = false;
+        public boolean settled = false;
         public long version = 1;
 
         public WindowAgg(long windowStart) {
@@ -92,10 +106,10 @@ public final class SymbolState {
         public Candle snapshot(String sym, long windowSizeMillis) {
             if (gap) {
                 return new Candle(sym, windowStart, windowStart + windowSizeMillis,
-                        null, null, null, null, 0L, true, false, version);
+                        null, null, null, null, 0L, true, false, version, settled);
             }
             return new Candle(sym, windowStart, windowStart + windowSizeMillis,
-                    open, high, low, close, volume, false, corrected, version);
+                    open, high, low, close, volume, false, corrected, version, settled);
         }
     }
 }

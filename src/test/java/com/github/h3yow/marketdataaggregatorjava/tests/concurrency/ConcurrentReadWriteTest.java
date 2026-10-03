@@ -23,6 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
@@ -139,7 +140,7 @@ class ConcurrentReadWriteTest {
         Set<String> violations = ConcurrentHashMap.newKeySet();
 
         // 1 个回补线程：把缺口 w1、w2 填满，且各自重复发送
-        pool.submit(() -> {
+        Future<?> backfillDone = pool.submit(() -> {
             await(start);
             for (int r = 0; r < 3; r++) {
                 ingest.ingest(new TradeTick("RWC", 10, T0 + 1200, 10, 5));
@@ -167,11 +168,13 @@ class ConcurrentReadWriteTest {
             });
         }
 
-        // 1 个游标拉取线程：分页拉完后 seq 集合应恰好 1..maxSeq
+        // 1 个游标拉取线程：分页拉完后 seq 集合应恰好 1..maxSeq。
+        // 为避免在回补线程尚未挂事件时因 hasMore=false 提前退出，先等回补结束再确认末尾。
         List<Long> pulledSeqs = new ArrayList<>();
         pool.submit(() -> {
             await(start);
             String cursor = null;
+            boolean caughtUp = false;
             for (int guard = 0; guard < 1000; guard++) {
                 CursorPage page = cursors.pull("RWC", cursor, 1);
                 synchronized (pulledSeqs) {
@@ -179,6 +182,13 @@ class ConcurrentReadWriteTest {
                 }
                 cursor = page.nextCursor();
                 if (!page.hasMore()) {
+                    if (!caughtUp) {
+                        // 第一次追平：等待回补线程结束后再复核一次，确认没有迟到追加事件
+                        safeGet(backfillDone);
+                        caughtUp = true;
+                        guard = 0;
+                        continue;
+                    }
                     break;
                 }
             }
@@ -217,6 +227,14 @@ class ConcurrentReadWriteTest {
             latch.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void safeGet(Future<?> future) {
+        try {
+            future.get(30, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
     }
 
