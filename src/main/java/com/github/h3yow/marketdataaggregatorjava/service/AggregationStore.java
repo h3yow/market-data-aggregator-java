@@ -234,6 +234,10 @@ public class AggregationStore {
 
     /**
      * 读取 seq 严格大于 afterSeq 的事件，最多 limit 条，保持追加顺序。
+     *
+     * <p>仅用于运维/测试对事件日志的原始检视，<b>不做压缩水位判定</b>；
+     * 面向客户端的增量拉取必须走 {@link #pullEvents(String, long, long, int)}，
+     * 以保证“游标之后有事件被折叠”时被明确拒绝而非静默返回改写后的序列。
      */
     public List<CursorEvent> readEvents(String symbol, long afterSeq, int limit) {
         SymbolState state = states.get(symbol);
@@ -251,6 +255,87 @@ public class AggregationStore {
                 }
             }
             return out;
+        }
+    }
+
+    /**
+     * 基于光标的增量拉取在存储层的原子结果。
+     *
+     * <p>必须在同一个 {@code synchronized(state)} 临界区内同时完成“压缩水位判定”
+     * 与“事件读取”：否则判定通过后、读取前若恰好发生一次压缩，客户端仍会静默读到
+     * 被改写过的序列。
+     *
+     * @param events    正常拉取时：seq 严格大于 afterSeq 的事件页（最多 limit 条）
+     * @param compacted 正常拉取时为 null；被压缩拒绝时携带恢复所需的 seq 信息
+     */
+    public record PullResult(List<CursorEvent> events, CompactedRecovery compacted) {
+
+        boolean ok() {
+            return compacted == null;
+        }
+
+        static PullResult page(List<CursorEvent> events) {
+            return new PullResult(events, null);
+        }
+
+        static PullResult compacted(CompactedRecovery recovery) {
+            return new PullResult(List.of(), recovery);
+        }
+    }
+
+    /**
+     * 游标续拉位置已被压缩折叠时的恢复描述（不含签名游标，由游标层签发）。
+     *
+     * @param cursorSeq           被拒游标携带的 seq
+     * @param compactedThroughSeq 当前压缩水位（被折叠事件的最大 seq）
+     * @param earliestRetainedSeq 压缩后日志中保留的最小事件 seq
+     */
+    public record CompactedRecovery(long cursorSeq, long compactedThroughSeq, long earliestRetainedSeq) {
+    }
+
+    /**
+     * 原子地完成压缩水位判定与增量读取。
+     *
+     * <p>压缩后日志里“折叠前保留下来的事件”（已结算窗口的 WINDOW_SETTLED）其 seq 可能
+     * <b>大于</b>压缩水位 F：折叠删除的是各窗口 OPEN/UPDATE/GAP/CORRECTION，而结算事件
+     * 是在窗口结算时才追加，排在很多被删除事件之后。因此“恢复授权”不是按 seq 区间放行，
+     * 而是按“该游标是否已被告知发生过压缩”放行：
+     * <ul>
+     *   <li>普通游标（{@code recoveryUpTo == 0}）：{@code 0 < afterSeq < F} 拒绝；
+     *       {@code afterSeq == 0}（从头）或 {@code afterSeq >= F} 正常读；</li>
+     *   <li>恢复游标（{@code recoveryUpTo > 0}，由服务端针对水位快照 F₀ 签发、受 HMAC 保护，
+     *       客户端无法伪造）：只要当前水位没有继续前进（{@code F <= F₀}），整个重放过程
+     *       都允许越过水位门，从而读到 seq 晚于 F 的保留结算事件；一旦恢复期间又发生了
+     *       新的压缩（{@code F > F₀}），授权失效，重新拒绝并签发更新后的恢复游标。</li>
+     * </ul>
+     */
+    public PullResult pullEvents(String symbol, long afterSeq, long recoveryUpTo, int limit) {
+        SymbolState state = states.get(symbol);
+        if (state == null) {
+            return PullResult.page(List.of());
+        }
+        synchronized (state) {
+            long frontier = state.compactedThroughSeq;
+            // 需要越过水位门的前提是游标仍停在折叠区间内（afterSeq < F）。
+            // 已走到 F 之后（含从头 afterSeq==0）本就正常，恢复游标是否还有授权无所谓；
+            // 只有“afterSeq < F 且恢复授权覆盖当前水位（F <= F0）”才放行，
+            // 若恢复期间又压缩使 F > F0，授权失效，重新拒绝并签发新恢复游标。
+            boolean needsGateBypass = afterSeq > 0 && afterSeq < frontier;
+            boolean authorizedRecovery = recoveryUpTo > 0 && frontier <= recoveryUpTo;
+            if (needsGateBypass && !authorizedRecovery) {
+                long earliest = state.events.isEmpty() ? 0L : state.events.get(0).seq();
+                return PullResult.compacted(new CompactedRecovery(afterSeq, frontier, earliest));
+            }
+            List<CursorEvent> out = new ArrayList<>();
+            for (CursorEvent event : state.events) {
+                if (event.seq() > afterSeq) {
+                    out.add(event);
+                    if (out.size() >= limit) {
+                        break;
+                    }
+                }
+            }
+            return PullResult.page(out);
         }
     }
 
@@ -273,15 +358,24 @@ public class AggregationStore {
      * <p>规则：每个已结算窗口只保留它的 {@link EventType#WINDOW_SETTLED} 事件
      * （该事件携带窗口最终快照，且恒为该窗口的最后一条事件——结算后任何迟到数据
      * 都会被拒绝，不可能再有新事件）；未结算窗口的事件一律不动。
-     * 被保留事件的 seq 不重编号，因此：
+     * 被保留事件的 seq 不重编号，新事件接着原序号递增，绝不复用。
+     *
+     * <p><b>游标兼容范围（唯一判定，不再“静默放行”）：</b>
+     * 本次折叠把“被删除事件的最大 seq”推进为压缩水位 {@code compactedThroughSeq}（只增不减）。
+     * 客户端游标携带 seq = c：
      * <ul>
-     *   <li>任何已签发游标压缩后仍然有效，继续拉取 {@code seq > cursor} 的事件即可；</li>
-     *   <li>被删除事件的窗口最终状态，必由同窗口的 WINDOW_SETTLED 事件（seq 更大）承载，
-     *       客户端重放（同窗口后到的快照覆盖先到的）得到的视图与压缩前完全一致；</li>
-     *   <li>同一 seq 永远不会重复下发，也不会出现“事件里一套、快照另一套”。</li>
+     *   <li>{@code c >= compactedThroughSeq}：不存在“seq 大于 c 的被折叠事件”，
+     *       继续拉取与未压缩时逐条一致（c 本身指向已消费过的被折叠事件也没关系，
+     *       它不在续拉区间内）；</li>
+     *   <li>{@code 0 < c < compactedThroughSeq}：游标续拉位置之后存在被折叠事件，
+     *       无法再保证与未压缩时逐条一致，{@link #pullEvents} 在同一把锁内原子判定并返回
+     *       {@link CompactedRecovery}，由上层明确拒绝并给出恢复起点，
+     *       绝不返回被改写过的序列让客户端误以为拿到了全部；</li>
+     *   <li>{@code c == 0}（首次从头拉取）：永远可用——每个已结算窗口都保留其
+     *       WINDOW_SETTLED（最终快照），从头重放仍能重建全部窗口的最终状态。</li>
      * </ul>
      * 在与接入相同的 {@code synchronized(state)} 临界区内执行，压缩与读写不会交错。
-     * 幂等：对已压缩过的日志再次执行不删除任何事件。
+     * 幂等：对已压缩过的日志再次执行不删除任何事件，压缩水位不变。
      */
     public CompactionReport compact(String symbol) {
         SymbolState state = states.get(symbol);
@@ -311,10 +405,41 @@ public class AggregationStore {
             }
             state.events.clear();
             state.events.addAll(kept);
+            // 压缩水位只增不减：本次若折叠了新结算窗口的事件，水位向前推进。
+            // 据此可在拉取侧识别“游标之后有事件被折叠”的旧游标并明确拒绝。
+            state.compactedThroughSeq = Math.max(state.compactedThroughSeq, maxDroppedSeq);
             CompactionReport report = new CompactionReport(
                     symbol, settledWindows, dropped, kept.size(), maxDroppedSeq);
             log.info("[COMPACT] {}", report);
             return report;
+        }
+    }
+
+    /**
+     * 该标的的压缩水位：被折叠删除事件的最大 seq（从未压缩过为 0）。
+     * 在 {@code synchronized(state)} 内读取，与拉取/压缩使用同一临界区。
+     */
+    public long compactedThroughSeq(String symbol) {
+        SymbolState state = states.get(symbol);
+        if (state == null) {
+            return 0L;
+        }
+        synchronized (state) {
+            return state.compactedThroughSeq;
+        }
+    }
+
+    /**
+     * 压缩后事件日志中仍保留的最小事件 seq；日志为空（无事件或全部被折叠，
+     * 实际不会发生——每个已结算窗口都保留其结算事件）时返回 0。
+     */
+    public long earliestRetainedSeq(String symbol) {
+        SymbolState state = states.get(symbol);
+        if (state == null) {
+            return 0L;
+        }
+        synchronized (state) {
+            return state.events.isEmpty() ? 0L : state.events.get(0).seq();
         }
     }
 }

@@ -78,8 +78,9 @@ public class MarketDataController {
     }
 
     /**
-     * 压缩该标的的事件日志：折叠已结算窗口的历史事件（seq 不重编号，
-     * 已签发游标全部继续有效）。返回本次压缩的统计报告。
+     * 压缩该标的的事件日志：折叠已结算窗口的历史事件（seq 不重编号）。
+     * 返回本次压缩的统计报告；压缩后游标兼容范围与恢复方式见事件拉取接口
+     * （旧游标要么继续逐条一致，要么收到 410 COMPACTED 及恢复起点/新游标）。
      */
     @PostMapping("/symbols/{symbol}/compact")
     public CompactionReport compact(@PathVariable String symbol) {

@@ -9,7 +9,10 @@
 - 基于签名游标的增量拉取：重复拉取不重不漏，过期 / 非法 / 串标游标明确拒绝
 - 事件流可独立重建视图：从任意有效游标重放，每个窗口的 OHLCV / 缺口 / 结算状态与区间快照查询完全一致
 - 窗口结算：越过“窗口终点 + 乱序容忍”即明确结算（`WINDOW_SETTLED`），之后不再被修正，客户端可安全落库
-- 事件日志可压缩：已结算窗口折叠为单条结算事件且 seq 不重编号，压缩后旧游标继续有效、重放结果不变
+- 事件日志可压缩：已结算窗口折叠为单条结算事件且 seq 不重编号。压缩后旧游标只有两种明确结局：
+  续拉区间未被折叠则与未压缩时**逐条一致**；续拉位置已被折叠则以 `COMPACTED`(410) **明确拒绝**
+  （绝不静默返回被改写的序列），并同时给出“从压缩水位继续向前”与“带授权的从头全量重建”两个恢复游标，
+  恢复后窗口最终状态与区间 K 线完全一致
 - 每标的独立加锁，并发接入与并发查询下同一窗口结果一致
 
 ---
@@ -87,10 +90,11 @@
 
   | reason | 条件 | HTTP |
   | --- | --- | --- |
-  | `MALFORMED` | 非两段式、base64 不可解码、载荷字段数/数字非法、seq 为负 | 400 |
-  | `BAD_SIGNATURE` | HMAC 校验失败（被篡改 / 密钥不符） | 400 |
+  | `MALFORMED` | 非两段式/载荷非 3 或 4 段、base64 不可解码、字段数/数字非法、seq 为负、恢复授权段非法 | 400 |
+  | `BAD_SIGNATURE` | HMAC 校验失败（被篡改 / 密钥不符 / 自行伪造 `R` 恢复授权段） | 400 |
   | `SYMBOL_MISMATCH` | 游标属于其他标的 | 400 |
   | `EXPIRED` | 超过 `cursor-ttl-millis` | 410 Gone |
+  | `COMPACTED` | 游标合法未过期，但续拉位置之后的事件已被压缩折叠（`0 < seq < 压缩水位`），无法逐条一致；响应体 `recovery` 字段给出两个恢复起点与新游标（见 1.7） | 410 Gone |
 
 ### 1.6 窗口结算（唯一确定、可复现）
 
@@ -106,21 +110,69 @@
   `CORRECTION`（被迟到数据修正）→ `WINDOW_SETTLED`（已结算，可安全落库）。
   只有收到 `WINDOW_SETTLED`（或快照中 `settled=true`）的窗口才保证不再变更。
 
-### 1.7 事件压缩与游标兼容范围
+### 1.7 事件压缩、归档与游标兼容范围
 
 - 压缩是显式运维动作：`POST /api/market-data/symbols/{symbol}/compact`
   （或调用 `MarketDataService.compact`），不在接入路径上自动执行。
 - 规则：**只折叠已结算窗口**的历史事件——每个已结算窗口仅保留其 `WINDOW_SETTLED` 事件
-  （恒为该窗口最后一条事件，携带最终快照），其余事件删除；未结算窗口的事件一律不动。
-- **所有保留事件的 seq 不重编号**，因此压缩后：
-  - 任何已签发游标（只要未超 TTL）继续有效，无需重新对齐；
-  - 旧游标继续拉取不重不漏：被删除事件的窗口最终状态，必由同窗口 seq 更大的
-    `WINDOW_SETTLED` 事件承载，客户端不会漏掉任何窗口的最终状态，也不会收到重复 seq；
-  - 从任意有效游标重放得到的视图与压缩前完全一致（见 `EventCompactionTest`）。
-- 压缩幂等：对已压缩日志再次执行不删除任何事件；压缩后新事件的 seq 接着原序号递增，绝不复用。
-- 兼容边界：游标仍受 `cursor-ttl-millis` 限制，超 TTL 的游标照旧以 `EXPIRED`(410) 拒绝，
-  客户端应丢弃后从头（不带 cursor）拉取——由于已结算窗口各自保留一条结算事件，
-  从头重放仍能重建全部窗口的最终状态。
+  （恒为该窗口最后一条事件，携带最终快照），其余 `OPEN/UPDATE/GAP/CORRECTION` 删除；
+  未结算窗口的事件一律不动。**所有保留事件 seq 不重编号**，压缩后新事件接着原序号递增，绝不复用。
+- 服务端为每个标的维护只增不减的**压缩水位 F**（历次被折叠事件的最大 seq）。
+
+#### 游标兼容范围（两种结局，判定唯一，绝不静默）
+
+设客户端游标携带 seq = `c`，压缩水位为 `F`（从未压缩时 `F=0`）：
+
+| 情形 | 条件 | 行为 |
+| --- | --- | --- |
+| 逐条一致 | `c >= F`（含 `c == F`：该位置事件虽已折叠，但已被客户端消费，其后事件全部保留） | 正常拉取，压缩前后同一游标拉到的事件序列**逐条相同、不漏不重** |
+| 从头可用 | `c == 0`（首次不带游标） | 永远可用：每个已结算窗口的结算事件都保留，从头重放可重建全部窗口最终状态 |
+| 明确不可用 | `0 < c < F`（续拉位置之后存在被折叠事件） | 返回 **410 Gone，`reason=COMPACTED`**，说明被折叠到哪个 seq，并给出两个恢复起点；**不会**静默返回被改写过的序列 |
+
+> 为什么不能“悄悄继续拉”？被删除的是各窗口在结算之前的中间事件，而结算事件是在结算时才追加、
+> seq 往往排在很多被删事件之后。压缩后从旧位置看到的事件序列与压缩前不再逐条相同
+> （有些尚未消费的中间事件永远消失了），因此必须让客户端显式选择恢复方式，
+> 而不是误以为拿到的就是全部。
+
+#### 收到 `COMPACTED` 后如何恢复
+
+错误体（HTTP 410）形如：
+
+```json
+{
+  "error": "INVALID_CURSOR",
+  "reason": "COMPACTED",
+  "message": "游标（seq=2）续拉位置之后的事件（seq 至 18）已被压缩折叠……",
+  "recovery": {
+    "cursorSeq": 2,
+    "compactedThroughSeq": 18,
+    "resumeFromSeq": 18,
+    "resumeCursor": "<签在压缩水位的新游标>",
+    "replayFromSeq": 0,
+    "fullReplayCursor": "<带恢复授权 R18 的从头游标>"
+  }
+}
+```
+
+两种恢复方式，任选其一：
+
+1. **继续向前（不回退、seq 不重号）**：用 `resumeCursor`（位置 = `compactedThroughSeq`）继续拉，
+   之后只会收到比水位更新的事件，编号只向前、不重复。注意折叠区间 `(cursorSeq, F]` 内
+   窗口的最终状态不在事件流里了——如客户端对这些窗口没有把握，用一次区间 K 线查询
+   `GET /candles` 补齐已结算窗口的最终状态，再叠加后续事件即可。
+2. **全量重建（推荐用于状态不可信时）**：丢弃本地状态，用 `fullReplayCursor`（seq=0，
+   带服务端 HMAC 签名的恢复授权段 `R<F>`）从头逐页重放。恢复授权让客户端可以读到
+   “seq 晚于水位、但属于折叠前保留下来的结算事件”；追平日志末尾后游标自动回归普通游标。
+   重建出的每个窗口 OHLCV / 缺口 / corrected / version / settled 与区间快照查询完全一致。
+
+恢复授权段与普通游标受同一 HMAC 保护，客户端**无法伪造或自行扩大授权**
+（篡改/伪造一律 `BAD_SIGNATURE` 400）。若全量重建途中又发生了新压缩、水位越过授权，
+服务端会再次返回 `COMPACTED` 并给出更新后的恢复游标；客户端取新的 `fullReplayCursor` 重新重建即可。
+
+- 压缩幂等：对已压缩日志再次执行不删除任何事件、水位不变；多轮压缩只会折叠**本轮新结算**窗口的事件，
+  水位只增不减。
+- 其它边界仍照旧：游标超过 `cursor-ttl-millis` 以 `EXPIRED`(410) 拒绝；
+  篡改/非法/串标分别为 `BAD_SIGNATURE` / `MALFORMED` / `SYMBOL_MISMATCH`（400）。
 
 ---
 
@@ -131,6 +183,8 @@
 - 因此同一窗口的 OHLCV 更新不会交错：成交量只在“判重通过后”累加一次，
   不丢失、不重复；并发查询读到的恒为某一笔（或某一串行化批次）之后的完整快照。
 - 事件日志在同一把锁内与窗口更新一起追加，seq 连续，查询与拉取不会读到半更新。
+- 压缩水位判定与事件读取在**同一把锁内原子完成**：不会出现“判定游标可用后、读取前恰好被压缩”
+  而静默读到改写序列的窗口；续拉位置已被折叠时原子地返回 `COMPACTED` 与恢复起点。
 - 并发测试验证：
   - 8 线程 × 4 轮争抢发送同一批 50 笔成交，唯一成交恰好接受 50 次、其余全部 `DUPLICATE`，
     各窗口成交量与手算期望值完全一致；
@@ -158,7 +212,7 @@
 | POST | `/api/market-data/symbols/{symbol}/ticks` | 接入一笔逐笔成交 |
 | GET | `/api/market-data/symbols/{symbol}/candles?from=&to=` | 查询区间 K 线（含缺口）；from/to 为毫秒时间戳，自动归整到窗口起点 |
 | GET | `/api/market-data/symbols/{symbol}/events?cursor=&limit=` | 游标增量拉取（首次不传 cursor） |
-| POST | `/api/market-data/symbols/{symbol}/compact` | 压缩事件日志：折叠已结算窗口的历史事件（seq 不重编号，旧游标继续有效），返回压缩统计 |
+| POST | `/api/market-data/symbols/{symbol}/compact` | 压缩事件日志：折叠已结算窗口的历史事件（seq 不重编号），返回压缩统计；压缩后旧游标要么继续逐条一致，要么收到 410 `COMPACTED` 及恢复起点（见 1.7） |
 
 接入请求体：
 
@@ -195,7 +249,7 @@
 mvn test
 ```
 
-共 38 个用例（均打印输入行情与判定依据日志）：
+共 44 个用例（均打印输入行情与判定依据/断言依据日志）：
 
 - `IngestIdempotencyTest`：重复推送（含伪造价格的重复）、判重优先于倒退、
   stale/late 可区分、容忍边界闭区间、各类非法字段
@@ -210,10 +264,22 @@ mvn test
 - `WindowSettlementTest`：结算边界恰好为“窗口终点+容忍”（差 1ms 不结算）、
   结算前可修正 / 结算后必拒、缺口窗口同样结算、生命周期事件可区分、
   同一脚本两遍事件流逐条一致（可复现）
-- `EventCompactionTest`：压缩后从头重放与压缩前及快照一致、压缩前的旧游标继续有效
-  （不重不漏收敛到快照）、压缩幂等且 seq 不复用、持续写入 + 并发压缩 + 持续拉取下
-  客户端重放视图仍与快照一致
+- `EventCompactionTest`（6 例，核心回归）：
+  - 压缩后从头（seq=0）重放与压缩前及快照一致；
+  - **逐条一致路径**：游标 seq 不小于压缩水位（含恰好等于水位的边界）时，
+    压缩前后同游标事件逐条相同、不漏不重，叠加存量视图后与快照一致；
+  - **明确不可用 + 恢复路径**：`0 < seq < 水位` 时以 `COMPACTED` 拒绝、绝不静默返回改写序列，
+    recovery 同时给出从水位继续向前（折叠区间用 K 线补齐）与带授权的从头全量重建两个游标，
+    两条路径恢复后的窗口状态都与区间快照一致；
+  - 反复压缩幂等、压缩水位只增不减，压缩后继续写入 seq 不复用、从头重放仍一致；
+  - 持续写入叠加反复压缩与 4 个持续拉取客户端：各客户端仅可能收到 `COMPACTED` 并按
+    fullReplayCursor 重建，收到的同一条事件不重复、seq 只向前，最终各自重建视图与快照一致。
+- `RecoveryCursorSecurityTest`：恢复授权段被篡改 / 客户端自行伪造 `R` 段一律
+  BAD_SIGNATURE；恢复途中又压缩使水位越过授权时，旧恢复游标失效并返回携带更高水位的新指引
+- `CompactionCursorWebTest`：HTTP 端到端断言旧游标返回 410 `COMPACTED` + recovery JSON，
+  用 fullReplayCursor 重建后逐窗口与 `/candles` 完全一致
 - `ConcurrentReadWriteTest`：并发重复写不丢不重、并发读单调不减、并发游标拉取不重不漏
+  （拉取线程停机条件已加固：写入未结束时只算“临时追平”，不再提前退出漏事件）
 
 ---
 
@@ -224,15 +290,41 @@ mvn test
 mvn spring-boot:run
 
 # 2. 从头拉取事件流，观察窗口生命周期事件（OPEN/UPDATE/GAP/CORRECTION/SETTLED）
-curl -s 'http://localhost:8080/api/market-data/symbols/DEMO/events?limit=1000'
+#    保存返回的 nextCursor，当作“压缩之前拿着的旧游标”
+curl -s 'http://localhost:8080/api/market-data/symbols/DEMO/events?limit=2'
 
 # 3. 与区间快照查询对比：同一窗口的最终状态必然一致
 curl -s 'http://localhost:8080/api/market-data/symbols/DEMO/candles'
 
-# 4. 压缩事件日志（折叠已结算窗口），返回压缩统计
+# 4. 压缩事件日志（折叠已结算窗口），返回压缩统计（含 maxDroppedSeq 压缩水位）
 curl -s -X POST 'http://localhost:8080/api/market-data/symbols/DEMO/compact'
 
-# 5. 用第 2 步拿到的同一个 nextCursor 继续拉取：不报错、不重不漏；
-#    或干脆不带 cursor 从头重放，得到的窗口最终状态与第 3 步快照完全一致
-curl -s 'http://localhost:8080/api/market-data/symbols/DEMO/events?limit=1000'
+# 5. 用第 2 步的旧游标继续拉：
+#    - 若游标 seq 已越过压缩水位：正常返回，事件序列与未压缩时逐条一致；
+#    - 若游标 seq 落在压缩水位之前：返回 HTTP 410，reason=COMPACTED，
+#      body.recovery 里同时给出 resumeCursor（从水位继续向前）与
+#      fullReplayCursor（带授权的从头全量重建游标）。
+curl -i 'http://localhost:8080/api/market-data/symbols/DEMO/events?limit=100&cursor=<第2步的nextCursor>'
+
+# 6. 方式一（全量重建，推荐）：丢弃本地状态，用 fullReplayCursor 从头逐页拉完，
+#    重建窗口与第 3 步 /candles 完全一致；翻页时透传每次返回的 nextCursor。
+curl -s 'http://localhost:8080/api/market-data/symbols/DEMO/events?limit=100&cursor=<fullReplayCursor>'
+
+# 7. 方式二（继续向前）：用 resumeCursor 从压缩水位继续，只收更新的事件、编号不重号；
+#    折叠区间内已结算窗口用一次 /candles 补齐最终状态。
+curl -s 'http://localhost:8080/api/market-data/symbols/DEMO/events?limit=100&cursor=<resumeCursor>'
+curl -s 'http://localhost:8080/api/market-data/symbols/DEMO/candles'
 ```
+
+测试与日志：
+
+```bash
+mvn test                                   # 全部 44 个用例
+mvn -Dtest=EventCompactionTest test        # 压缩一致性 / 幂等 / 并发核心用例
+mvn -Dtest=RecoveryCursorSecurityTest test # 恢复游标防伪造与授权失效
+mvn -Dtest=CompactionCursorWebTest test    # HTTP 410 + recovery 端到端
+```
+
+日志中可看到每个用例的判定依据：`[TEST-INPUT]` 输入了哪些行情、
+`[TEST-DECISION]` 每笔的接入判定、`[TEST-ASSERT]` 每个断言比较的 seq/窗口集合与结果、
+`[COMPACT]` 压缩报告、`[CURSOR] ... 被压缩拒绝` 的水位与恢复信息。

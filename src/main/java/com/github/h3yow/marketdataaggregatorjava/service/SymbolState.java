@@ -34,6 +34,15 @@ public final class SymbolState {
     public final List<CursorEvent> events = new ArrayList<>();
     public long nextSeq = 1L;
 
+    /**
+     * 压缩水位：历次压缩中被折叠删除事件的最大 seq（从未折叠过为 0），只增不减。
+     * 用于判定旧游标能否保证逐条一致：{@code 0 < cursorSeq < compactedThroughSeq}
+     * 说明游标续拉位置之后存在被折叠的事件，必须明确拒绝并给出恢复起点，
+     * 而不是静默返回被改写过的序列；{@code cursorSeq >= compactedThroughSeq}
+     * （含恰好等于水位：该位置事件虽已折叠，但已被客户端消费，其后事件全保留）可正常续拉。
+     */
+    public long compactedThroughSeq = 0L;
+
     public SymbolState(String symbol) {
         this.symbol = symbol;
     }

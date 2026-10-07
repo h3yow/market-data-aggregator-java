@@ -24,6 +24,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -137,6 +138,7 @@ class ConcurrentReadWriteTest {
         ExecutorService pool = Executors.newFixedThreadPool(6);
         CountDownLatch start = new CountDownLatch(1);
         Set<String> violations = ConcurrentHashMap.newKeySet();
+        AtomicBoolean backfillDone = new AtomicBoolean(false);
 
         // 1 个回补线程：把缺口 w1、w2 填满，且各自重复发送
         pool.submit(() -> {
@@ -145,6 +147,7 @@ class ConcurrentReadWriteTest {
                 ingest.ingest(new TradeTick("RWC", 10, T0 + 1200, 10, 5));
                 ingest.ingest(new TradeTick("RWC", 11, T0 + 2200, 10, 7));
             }
+            backfillDone.set(true);
         });
 
         // 4 个查询线程：同一窗口的成交量必须单调不减
@@ -167,7 +170,8 @@ class ConcurrentReadWriteTest {
             });
         }
 
-        // 1 个游标拉取线程：分页拉完后 seq 集合应恰好 1..maxSeq
+        // 1 个游标拉取线程：回补线程结束前只能“临时追平”，必须在其结束后再确认一次，
+        // 否则可能把回补结束前的空页当成终态而漏掉最后一批事件（修复既有 flaky）。
         List<Long> pulledSeqs = new ArrayList<>();
         pool.submit(() -> {
             await(start);
@@ -179,7 +183,23 @@ class ConcurrentReadWriteTest {
                 }
                 cursor = page.nextCursor();
                 if (!page.hasMore()) {
-                    break;
+                    if (!backfillDone.get()) {
+                        try {
+                            Thread.sleep(1);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                        continue;
+                    }
+                    // 回补已结束：再拉一次确认没有在两次调用之间落入新事件
+                    CursorPage confirm = cursors.pull("RWC", cursor, 1);
+                    synchronized (pulledSeqs) {
+                        confirm.events().stream().map(CursorEvent::seq).forEach(pulledSeqs::add);
+                    }
+                    if (confirm.events().isEmpty() && !confirm.hasMore()) {
+                        break;
+                    }
+                    cursor = confirm.nextCursor();
                 }
             }
         });
