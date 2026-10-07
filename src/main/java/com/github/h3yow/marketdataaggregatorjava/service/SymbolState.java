@@ -33,6 +33,13 @@ public final class SymbolState {
     public Long maxWindowStart = null;
     public final List<CursorEvent> events = new ArrayList<>();
     public long nextSeq = 1L;
+    /**
+     * 压缩前沿：历次压缩中被删除事件 seq 的高水位（从未删除过时为 0）。
+     * 续拉游标 {@code seq < compactedThroughSeq} 时，其位置已被压缩、
+     * 无法保证逐条一致，必须显式拒绝并给出恢复起点；{@code seq >= 此值}
+     * 的游标看到的事件序列与未压缩时完全一致。该值单调不减（重复压缩不回退）。
+     */
+    public long compactedThroughSeq = 0L;
 
     public SymbolState(String symbol) {
         this.symbol = symbol;

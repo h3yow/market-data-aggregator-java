@@ -273,20 +273,27 @@ public class AggregationStore {
      * <p>规则：每个已结算窗口只保留它的 {@link EventType#WINDOW_SETTLED} 事件
      * （该事件携带窗口最终快照，且恒为该窗口的最后一条事件——结算后任何迟到数据
      * 都会被拒绝，不可能再有新事件）；未结算窗口的事件一律不动。
-     * 被保留事件的 seq 不重编号，因此：
+     * 被保留事件的 seq 不重编号，并记录本标的“压缩前沿” {@code compactedThroughSeq}
+     * （历次被删除事件 seq 的高水位，单调不减）。
+     *
+     * <p>游标兼容范围（同一游标压缩前后看到的内容）：
      * <ul>
-     *   <li>任何已签发游标压缩后仍然有效，继续拉取 {@code seq > cursor} 的事件即可；</li>
-     *   <li>被删除事件的窗口最终状态，必由同窗口的 WINDOW_SETTLED 事件（seq 更大）承载，
-     *       客户端重放（同窗口后到的快照覆盖先到的）得到的视图与压缩前完全一致；</li>
-     *   <li>同一 seq 永远不会重复下发，也不会出现“事件里一套、快照另一套”。</li>
+     *   <li><b>cursor.seq &gt;= compactedThroughSeq</b>：该位置之后的事件一条未删，
+     *       续拉序列与未压缩时<b>逐条一致</b>（不重不漏）；</li>
+     *   <li><b>cursor.seq &lt; compactedThroughSeq</b>：续拉位置所在事件已被删除，
+     *       无法再保证逐条一致，{@code pull} 明确以
+     *       {@link CursorException.Reason#COMPACTED} 拒绝并返回恢复起点（seq=0、
+     *       新游标），绝不静默返回对不上的半截序列。客户端改用新游标从头重放：
+     *       已结算窗口各自保留一条结算事件（最终快照），未结算窗口事件未动，
+     *       重建出的每个窗口状态与区间查询完全一致。</li>
      * </ul>
      * 在与接入相同的 {@code synchronized(state)} 临界区内执行，压缩与读写不会交错。
-     * 幂等：对已压缩过的日志再次执行不删除任何事件。
+     * 幂等：对已压缩过的日志再次执行不删除任何事件、压缩前沿不回退。
      */
     public CompactionReport compact(String symbol) {
         SymbolState state = states.get(symbol);
         if (state == null) {
-            return new CompactionReport(symbol, 0, 0, 0, 0L);
+            return new CompactionReport(symbol, 0, 0, 0, 0L, 0L);
         }
         synchronized (state) {
             List<CursorEvent> kept = new ArrayList<>(state.events.size());
@@ -311,10 +318,107 @@ public class AggregationStore {
             }
             state.events.clear();
             state.events.addAll(kept);
+            // 记录压缩前沿（单调不减）：续拉位置落在该 seq 之前（严格小于）的游标
+            // 已无法逐条一致，必须显式拒绝并引导恢复；重复压缩不回退该值。
+            state.compactedThroughSeq = Math.max(state.compactedThroughSeq, maxDroppedSeq);
             CompactionReport report = new CompactionReport(
-                    symbol, settledWindows, dropped, kept.size(), maxDroppedSeq);
+                    symbol, settledWindows, dropped, kept.size(), maxDroppedSeq,
+                    state.compactedThroughSeq);
             log.info("[COMPACT] {}", report);
             return report;
+        }
+    }
+
+    /**
+     * 该标的的压缩前沿（历次压缩被删除事件 seq 的高水位，从未压缩为 0）。
+     */
+    public long compactedThroughSeq(String symbol) {
+        SymbolState state = states.get(symbol);
+        if (state == null) {
+            return 0L;
+        }
+        synchronized (state) {
+            return state.compactedThroughSeq;
+        }
+    }
+
+    /**
+     * 当前日志中最早一条仍保留事件的 seq（空日志为 0）。
+     * 压缩的无损恢复起点即该 seq（不含）：从此处重放恰好遍历全部保留事件，
+     * 每个已结算窗口的 WINDOW_SETTLED 最终快照都在其中。
+     * 注意保留事件的 seq 可能小于压缩前沿（更早窗口的结算事件），
+     * 因此不能用 frontier 本身作为恢复序号。
+     */
+    public long firstRetainedSeq(String symbol) {
+        SymbolState state = states.get(symbol);
+        if (state == null) {
+            return 0L;
+        }
+        synchronized (state) {
+            return state.events.isEmpty() ? 0L : state.events.get(0).seq();
+        }
+    }
+
+    /**
+     * 基于游标的增量拉取的判定与读取结果（同一把锁内完成，杜绝
+     * “先判位置、后压缩、再读”的 TOCTOU 错配）。
+     *
+     * <p>两类游标承诺不同：
+     * <ul>
+     *   <li><b>常规游标（recovery=false）</b>承诺逐条一致：其后只要有被删事件
+     *       （{@code seq < compactedThroughSeq}）即拒绝，由调用方返回恢复起点；</li>
+     *   <li><b>恢复游标（recovery=true）</b>只承诺最终视图一致：其后有被删事件
+     *       也不拒绝；若位置已落在“整段更老的、不再保留任何事件”的区间
+     *       （{@code seq < 首条保留事件-1}），则在锁内把读取位置透明快进到
+     *       当前日志开头后读取。跳过的都是更老已结算窗口的中间态，其
+     *       WINDOW_SETTLED 最终快照仍在保留日志内，因此视图无损、seq 只向前，
+     *       且不会在压缩持续推进时陷入“反复重置”活锁。</li>
+     * </ul>
+     *
+     * @param recovery 是否压缩恢复游标（4 段 payload）；false 为常规游标
+     */
+    public PullOutcome pullFrom(String symbol, long afterSeq, boolean recovery, int limit) {
+        SymbolState state = states.get(symbol);
+        if (state == null) {
+            return new PullOutcome(0L, 0L, List.of(), 0L, false);
+        }
+        synchronized (state) {
+            long firstRetained = state.events.isEmpty() ? 0L : state.events.get(0).seq();
+            if (!recovery) {
+                // 常规游标承诺逐条一致：其后只要存在被删事件（seq < 前沿）即拒绝
+                if (afterSeq < state.compactedThroughSeq) {
+                    return new PullOutcome(afterSeq, state.compactedThroughSeq,
+                            List.of(), firstRetained, true);
+                }
+            } else if (afterSeq < firstRetained - 1) {
+                // 恢复游标只承诺最终视图：位置落在“已整段删除的更老历史”时
+                // 透明快进到当前保留日志开头——被跳过的都是更老已结算窗口，
+                // 其 WINDOW_SETTLED 最终快照仍在保留日志内，视图无损、
+                // seq 只向前，且不会在压缩推进时反复重置（活锁）。
+                afterSeq = Math.max(0L, firstRetained - 1);
+            }
+            List<CursorEvent> out = new ArrayList<>();
+            for (CursorEvent event : state.events) {
+                if (event.seq() > afterSeq) {
+                    out.add(event);
+                    if (out.size() >= limit) {
+                        break;
+                    }
+                }
+            }
+            return new PullOutcome(afterSeq, state.compactedThroughSeq, List.copyOf(out), firstRetained, false);
+        }
+    }
+
+    /**
+     * 拉取原子结果。{@code rejected} 为 true 时 {@code events} 必为空，
+     * {@code resumeHead} 是可用的恢复起点（afterSeq 语义）。
+     */
+    public record PullOutcome(long afterSeq, long compactedThroughSeq, List<CursorEvent> events,
+                              long firstRetainedSeq, boolean rejected) {
+        /** 恢复起点（首条保留事件 seq 之前；空日志为 0）。 */
+        public long resumeHead() {
+            return Math.max(0L, firstRetainedSeq - 1);
         }
     }
 }
